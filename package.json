@@ -11,7 +11,7 @@
     "dotenv": "^17.3.1",
     "express": "^4.21.2",
     "knex": "^3.1.0",
-    "lodestar-sdk": "git@github.com:urfit-tech/lodestar-sdk.git",
+    "lodestar-sdk": "^0.1.1",
     "pg": "^8.18.0"
   },
   "devDependencies": {

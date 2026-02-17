@@ -2,8 +2,7 @@ import express from 'express'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import dotenv from 'dotenv'
-import { createKnex } from 'lodestar-sdk/src/db'
-import { createAppRepo } from 'lodestar-sdk/src/repositories/AppRepo'
+import { AppRepository, Member, createLodestarDataSource } from 'lodestar-sdk'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -18,10 +17,36 @@ if (!postgresUrl) {
   throw new Error('Missing POSTGRES_URL in environment variables')
 }
 
-const db = createKnex({ connection: postgresUrl })
-const appRepo = createAppRepo(db)
+const dataSource = createLodestarDataSource({ url: postgresUrl })
+const appRepo = new AppRepository(dataSource)
+
+async function listenWithFallback(app: express.Express, startPort: number, maxAttempts = 10) {
+  let currentPort = startPort
+  let attempts = 0
+
+  while (attempts < maxAttempts) {
+    attempts += 1
+    try {
+      const server = await new Promise<ReturnType<express.Express['listen']>>((resolve, reject) => {
+        const nextServer = app.listen(currentPort, () => resolve(nextServer))
+        nextServer.once('error', reject)
+      })
+      return { server, boundPort: currentPort }
+    } catch (error) {
+      const nodeError = error as NodeJS.ErrnoException
+      if (nodeError.code !== 'EADDRINUSE' || attempts >= maxAttempts) {
+        throw error
+      }
+      currentPort += 1
+    }
+  }
+
+  throw new Error(`Unable to start server after ${maxAttempts} attempts`)
+}
 
 async function bootstrap() {
+  await dataSource.initialize()
+
   const app = express()
   app.use(express.json())
   app.use(express.static(publicDir))
@@ -33,17 +58,12 @@ async function bootstrap() {
     }
 
     try {
-      const appData = await appRepo.getById(appId)
+      const appData = await appRepo.getAppById(appId)
       if (!appData) {
         return res.status(404).json({ message: `找不到 app：${appId}` })
       }
 
-      const countRow = await db('member')
-        .where('app_id', appId)
-        .count<{ count: string }>({ count: '*' })
-        .first()
-
-      const memberCount = Number(countRow?.count || 0)
+      const memberCount = await dataSource.getRepository(Member).count({ where: { appId } })
       return res.json({ appId, memberCount })
     } catch (error) {
       console.error('get member count failed', error)
@@ -55,13 +75,14 @@ async function bootstrap() {
     res.sendFile(path.join(publicDir, 'index.html'))
   })
 
-  const server = app.listen(port, () => {
-    console.log(`Server running at http://localhost:${port}`)
-  })
+  const { server, boundPort } = await listenWithFallback(app, port)
+  console.log(`Server running at http://localhost:${boundPort}`)
 
   const gracefulShutdown = async () => {
     server.close(async () => {
-      await db.destroy()
+      if (dataSource.isInitialized) {
+        await dataSource.destroy()
+      }
       process.exit(0)
     })
   }
@@ -72,6 +93,8 @@ async function bootstrap() {
 
 bootstrap().catch(async (error) => {
   console.error('Server bootstrap failed', error)
-  await db.destroy()
+  if (dataSource.isInitialized) {
+    await dataSource.destroy()
+  }
   process.exit(1)
 })
